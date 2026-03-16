@@ -8,7 +8,7 @@ url="https://github.com/OrnelasD-Rogers/acer-nitro-ec"
 license=('GPL-2.0-only')
 depends=('dkms')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('12b3d15144f6e1282c6accb0bb40788dd6f05b1e854fbbd4afc5cfd9dea09e36')
 
 package() {
 	cd "$srcdir/acer-nitro-ec-$pkgver"
