@@ -30,6 +30,7 @@
  *       sudo dmesg -w | grep acer-nitro-ec
  */
 
+#include <asm-generic/errno.h>
 #define DRIVER_NAME "acer-nitro-ec"
 #define pr_fmt(fmt) DRIVER_NAME ": " fmt
 
@@ -137,6 +138,43 @@ struct nitro_ec_data {
 /* EC helpers                                                           */
 /* ------------------------------------------------------------------ */
 
+static acpi_status nitro_wmi_exec(struct device *dev, u32 method_id, u64 in,
+		u64 *out)
+{
+	struct acpi_buffer input = { sizeof(u64), &in };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+	u64 tmp = 0;
+
+	status = wmi_evaluate_method(WMID_GUID4, 0, method_id, &input, &result);
+	if (ACPI_FAILURE(status)) {
+		dev_warn(dev, "WMI method 0x%x failed: %s\n", method_id,
+				acpi_format_exception(status));
+		return status;
+	}
+
+	obj = result.pointer;
+	if (obj) {
+		if (obj->type == ACPI_TYPE_BUFFER) {
+			if (obj->buffer.length == sizeof(u32)))
+				tmp = *((u32 *)obj->buffer.pointer);
+			else if (obj->buffer.length == sizeof(u64))
+				tmp = *((u64 *)obj->buffer.pointer);
+		} else if (obj->type == ACPI_TYPE_INTEGER) {
+			tmp = (u64)obj->integer.value;
+		}
+	}
+
+	if (out)
+		*out = tmp;
+
+	kfree(result.pointer);
+	nitro_dbg(dev, "WMI method ox%x(in=0x%llx) -> 0x%llx\n", method_id, in, tmp);
+
+	return status;
+}
+
 static int nitro_ec_read(u8 addr, u8 *val)
 {
 	int ret = ec_read(addr, val);
@@ -205,96 +243,73 @@ static int nitro_read_fan_rpm(struct device *dev,
 /* hwmon callbacks                                                      */
 /* ------------------------------------------------------------------ */
 
+static const enum nitro_sensor_id nitro_temp_sensor[] = {
+	[0]=NITRO_SENSOR_CPU_TEMP, [1]=NITRO_SENSOR_GPU_TEMP, [2]=NITRO_SENSOR_SYS_TEMP,
+};
+
+static const enum nitro_sensor_id nitro_fan_sensor[] = {
+	[0]=NITRO_SENSOR_CPU_FAN_SPEED, [1]=NITRO_SENSOR_GPU_FAN_SPEED,
+};
+
 static umode_t nitro_hwmon_is_visible(const void *drvdata,
-				      enum hwmon_sensor_types type,
-				      u32 attr, int channel)
+		enum hwmon_sensor_types type, u32 attr, int channel)
 {
+	const struct nitro_data *data = drvdata;
+	enum nitro_sensor_id sensor;
+
 	switch (type) {
-	case hwmon_fan:
-		return 0444;
-	case hwmon_pwm:
-		return 0644;
-	case hwmon_temp:
-		return 0444;
-	default:
-		return 0;
+		case hwmon_fan:
+			if (channel >= ARRAY_SIZE(nitro_fan_sensor))
+				return 0;
+			sensor = nitro_fan_sensor[channel];
+			return (data->supported_sensors & BIT(sensor - 1)) ? 0444 : 0;
+		case hwmon_pwm:
+			if (channel >= ARRAY_SIZE(nitro_fan_sensor))
+				return 0;
+			sensor = nitro_fan_sensor[channel];
+			return (data->supported_sensors & BIT(sensor - 1)) ? 0644 : 0;
+		case hwmon_temp:
+			if (channel >= ARRAY_SIZE(nitro_temp_sensor))
+				return 0;
+			sensor = nitro_temp_sensor[channel];
+			return (data->supported_sensors & BIT(sensor - 1)) ? 0444 : 0;
+		default:
+			return 0;
 	}
-}
+};
 
 static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			    u32 attr, int channel, long *val)
 {
-	struct nitro_ec_data *data = dev_get_drvdata(dev);
-	const struct nitro_ec_regs *regs = data->regs;
-	u8 raw;
-	int ret;
+	struct nitro_data *data = dev_get_drvdata(dev);
 
 	switch (type) {
-
 	case hwmon_fan:
-		return nitro_read_fan_rpm(dev, regs, channel, val);
+		if(channel >= ARRAY_SIZE(nitro_fan_sensor))
+			return -EOPNOTSUPP;
+		return nitro_read_sensor(dev, nitro_fan_sensor[channel], false, val);
 
+	case hwmon_temp:
+		if (channel >= ARRAY_SIZE(nitro_temp_sensor))
+			return -EOPNOTSUPP;
+		return nitro_read_sensor(dev, nitro_temp_sensor[channel], true, val);
 	case hwmon_pwm:
+		if (channel >= 2)
+			return -EOPNOTSUPP;
 		switch (attr) {
-
-		case hwmon_pwm_input:
-			ret = nitro_ec_read(channel == 0
-					    ? regs->cpu_fan_speed_ctrl
-					    : regs->gpu_fan_speed_ctrl, &raw);
-			if (ret)
-				return ret;
-			/* EC uses 0-100%; hwmon expects 0-255 */
-			*val = (long)raw * 255 / 100;
-			nitro_dbg(dev, "%s pwm read: EC=%u%% hwmon=%ld\n",
-				  channel == 0 ? "CPU" : "GPU", raw, *val);
-			return 0;
-
-		case hwmon_pwm_enable:
-			ret = nitro_ec_read(channel == 0
-					    ? regs->cpu_fan_mode_ctrl
-					    : regs->gpu_fan_mode_ctrl, &raw);
-			if (ret)
-				return ret;
-			if (channel == 0) {
-				if (raw == CPU_TURBO_MODE)
-					*val = 0;
-				else if (raw == CPU_MANUAL_MODE)
-					*val = 1;
-				else
-					*val = 2; /* auto */
-			} else {
-				if (raw == GPU_TURBO_MODE)
-					*val = 0;
-				else if (raw == GPU_MANUAL_MODE)
-					*val = 1;
-				else
-					*val = 2; /* auto */
-			}
-			nitro_dbg(dev,
-				  "%s mode read: EC=0x%02X -> pwm_enable=%ld "
-				  "(0=turbo 1=manual 2=auto)\n",
-				  channel == 0 ? "CPU" : "GPU", raw, *val);
-			return 0;
+			case hwmon_pwm_input:
+				/* Cached last-written value */
+				mutex_lock(&data->lock);
+				*val = (long)data->duty_pct[channel] * 255 / 100;
+				mutex_unlock(&data->lock);
+				return 0;
+			case hwmon_pwm_enable:
+				mutex_lock(&data->lock);
+				*val = data->mode[channel];
+				return 0;
+			default:
+				return -EOPNOTSUPP;
 		}
-		break;
-
-	case hwmon_temp: {
-		static const char * const temp_names[] = {
-			"CPU", "GPU", "system"
-		};
-		switch (channel) {
-		case 0: ret = nitro_ec_read(regs->cpu_temp, &raw); break;
-		case 1: ret = nitro_ec_read(regs->gpu_temp, &raw); break;
-		case 2: ret = nitro_ec_read(regs->sys_temp, &raw); break;
-		default: return -EOPNOTSUPP;
-		}
-		if (ret)
-			return ret;
-		*val = (long)raw * 1000; /* millidegrees */
-		nitro_dbg(dev, "%s temp: %u°C\n", temp_names[channel], raw);
-		return 0;
-	}
-
 	default:
 		break;
 	}
