@@ -95,10 +95,22 @@ enum nitro_sensor_id {
 #define NITRO_SUPPORTED_SENSORS_MASK  GENMASK_ULL(39, 24)
 
 
+/*
+ * Fan-behavior payload for SET_FAMING_FAN_BEHAVIOR
+ *
+ *These are opaque vendor magic number (reverse-engineered from the
+  Windows utilitys WMI traffic, not ducmented by acer). They are named
+  here for readbility but the values themselves are not something this driver can validate independently
+ *
+ * */
 
-
-
-
+#define FAN_BEHAVIOR_MAX_BOTH 	0x820009ULL /* turbo: both fans full speed */
+#define FAN_BEHAVIOR_AUTO_BOTH 	0x410009ULL /* auto: firmware manages both */
+#define FAN_BEHAVIOR_CUSTOM_GPU_ONLY_A 	0x010001ULL /* enter cutom mode, GPU driven */
+#define FAN_BEHAVIOR_CUSTOM_GPU_ONLY_B 	0xC00008ULL
+#define FAN_BEHAVIOR_CUSTOM_CPU_ONLY_A 	0x400008ULL /* enter custom mode, CPU driven */
+#define FAN_BEHAVIOR_CUSTOM_CPU_ONLY_B 0x030001ULL
+#define FAN_BEHAVIOR_CUSTOM_MIXED 	0xC30009ULL /* both fans independently set*/
 
 #define FAN_INDEX_CPU 1
 #define FAN_INDEX_GPU 4
@@ -113,8 +125,12 @@ enum nitro_sensor_id {
 /* ------------------------------------------------------------------ */
 
 struct nitro_ec_data {
-	struct device		  *hwmon_dev;
-	const struct nitro_ec_regs *regs;
+	struct device 	*hwmon_dev;
+	struct mutes 	lock; /* protects mode[]/duty_pct[] + WMI writes */
+
+	u64 		supported_sensors;
+	u8 		mode[2];
+	u8 		duty_pct[2];
 };
 
 /* ------------------------------------------------------------------ */
