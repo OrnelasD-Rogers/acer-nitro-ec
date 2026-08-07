@@ -40,6 +40,11 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/bitfield.h>
+#include <linux/bitops.hi>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/wmi.h>
 
 /* When debug=1, emit dev_dbg messages as dev_info so they appear in dmesg
  * without needing to change the kernel log level or dynamic_debug config.
@@ -58,65 +63,50 @@ MODULE_PARM_DESC(debug, "Enable verbose logging (default: false). "
 } while (0)
 
 /* ------------------------------------------------------------------ */
-/* EC register map                                                      */
+/* ACER-WMI Interface                                                  */
 /* ------------------------------------------------------------------ */
 
-struct nitro_ec_regs {
-	u8 cpu_fan_mode_ctrl;
-	u8 cpu_fan_speed_ctrl;
-	u8 cpu_fan_rpm_hi;
-	u8 cpu_fan_rpm_lo;
-	u8 gpu_fan_mode_ctrl;
-	u8 gpu_fan_speed_ctrl;
-	u8 gpu_fan_rpm_hi;
-	u8 gpu_fan_rpm_lo;
-	u8 cpu_temp;
-	u8 gpu_temp;
-	u8 sys_temp;
-};
-
-/* Fan mode EC values */
-#define CPU_AUTO_MODE		0x04
-#define CPU_MANUAL_MODE		0x0C
-#define CPU_TURBO_MODE		0x08
-#define GPU_AUTO_MODE		0x10
-#define GPU_MANUAL_MODE		0x30
-#define GPU_TURBO_MODE		0x20
-
 /*
- * AN515-46 register layout — shared by most AN515/AN517 models.
- * Source: reverse-engineered from Linux-NitroSense project.
+ *GUID for the Acer WMI device that exposes sensor readout
+ * and fan-control method on Nitro and Predator laptops. Sma GUID used by the
+ * acer-wmi driver's interface helpers.
  */
-static const struct nitro_ec_regs regs_an515_46 = {
-	.cpu_fan_mode_ctrl  = 0x22,
-	.cpu_fan_speed_ctrl = 0x37,
-	.cpu_fan_rpm_hi     = 0x13,
-	.cpu_fan_rpm_lo     = 0x14,
-	.gpu_fan_mode_ctrl  = 0x21,
-	.gpu_fan_speed_ctrl = 0x3A,
-	.gpu_fan_rpm_hi     = 0x15,
-	.gpu_fan_rpm_lo     = 0x16,
-	.cpu_temp           = 0xB0,
-	.gpu_temp           = 0xB6,
-	.sys_temp           = 0xB3,
+
+#define WMID_GUID4         "7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56"
+
+#define ACER_WMID_GET_GAMING_SYS_INFO_METHODID 5
+#define ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID 14
+#define ACER_WMID_SET_GAMING_FAN_SPEED_METHODID 16
+
+#define ACER_WMID_CMD_GET_SUPPORTED_SENSORS 0x0000
+#define ACER_WMID_CMD_GET_SENSOR_READING 0x0001
+
+enum nitro_sensor_id {
+	NITRO_SENSOR_CPU_TEMP = 0X01,
+	NITRO_SENSOR_CPU_FAN_SPEED = 0X02,
+	NITRO_SENSOR_SYS_TEMP = 0X03,
+	NITRO_SENSOR_GPU_FAN_SPEED = 0X06,
+	NITRO_SENSOR_GPU_TEMP = 0X0A,
 };
 
-/*
- * AN515-44 differs only in GPU/system temperature register addresses.
- */
-static const struct nitro_ec_regs regs_an515_44 = {
-	.cpu_fan_mode_ctrl  = 0x22,
-	.cpu_fan_speed_ctrl = 0x37,
-	.cpu_fan_rpm_hi     = 0x13,
-	.cpu_fan_rpm_lo     = 0x14,
-	.gpu_fan_mode_ctrl  = 0x21,
-	.gpu_fan_speed_ctrl = 0x3A,
-	.gpu_fan_rpm_hi     = 0x15,
-	.gpu_fan_rpm_lo     = 0x16,
-	.cpu_temp           = 0xB0,
-	.gpu_temp           = 0xB4,
-	.sys_temp           = 0xB0,
-};
+#define NITRO_RETURN_STATUS_MASK  GENMASK_ULL(7, 0)
+#define NITRO_SENSOR_INDEX_MASK  GENMASK_ULL(15, 8)
+#define NITRO_SENSOR_READING_MASK  GENMASK_ULL(23, 8)
+#define NITRO_SUPPORTED_SENSORS_MASK  GENMASK_ULL(39, 24)
+
+
+
+
+
+
+
+#define FAN_INDEX_CPU 1
+#define FAN_INDEX_GPU 4
+
+#define NITRO_MODE_TURBO 0
+#define NITRO_MODE_MANUAL 1
+#define NITRO_MODE_AUTO 2
+
 
 /* ------------------------------------------------------------------ */
 /* Per-device data                                                      */
