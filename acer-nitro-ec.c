@@ -30,20 +30,18 @@
  *       sudo dmesg -w | grep acer-nitro-ec
  */
 
-#include <asm-generic/errno-base.h>
-#include <asm-generic/errno.h>
 #define DRIVER_NAME "acer-nitro-ec"
 #define pr_fmt(fmt) DRIVER_NAME ": " fmt
 
 #include <linux/acpi.h>
+#include <linux/bitfield.h>
+#include <linux/bitops.h>
 #include <linux/dmi.h>
 #include <linux/hwmon.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
-#include <linux/bitfield.h>
-#include <linux/bitops.hi>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/wmi.h>
@@ -135,9 +133,8 @@ struct nitro_ec_data {
 	u8 		duty_pct[2];
 };
 
-/* ------------------------------------------------------------------ */
-/* EC helpers                                                           */
-/* ------------------------------------------------------------------ */
+
+/* WMI helpers                                                           */
 
 static acpi_status nitro_wmi_exec(struct device *dev, u32 method_id, u64 in,
 		u64 *out)
@@ -176,24 +173,147 @@ static acpi_status nitro_wmi_exec(struct device *dev, u32 method_id, u64 in,
 	return status;
 }
 
-static int nitro_wmi_get_sys_info()
+static int nitro_wmi_get_sys_info(struct device *dev, u64 command, u64 *out)
 {
+	acpi_status status;
+	u64 result;
 
+	status = nitro_wmi_exec(dev, ACER_WMID_GET_GAMING_SYS_INFO_METHODID,
+			command, &result);
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	/* Low byte of the response is a firmware status code; 0 = success.*/
+	if (FIELD_GET(NITRO_RETURN_STATUS_MASK, result))
+		return -EIO;
+
+	*out = result;
+	return 0;
 }
 
-static int nitro_read_sensor()
+static int nitro_read_sensor(struct device *dev, enum nitro_sensor_id sensor, bool is_temp, long *val)
 {
+	u64 command = ACER_WMID_CMD_GET_SENSOR_READING;
+	u64 result;
+	int ret;
 
+	command |= FIELD_PREP(NITRO_SENSOR_INDEX_MASK, sensor);
+
+	ret = nitro_wmi_get_sys_info(dev, command, &result);
+	if (ret)
+		return ret;
+
+	result = FIELD_GET(NITRO_SENSOR_READING_MASK, result);
+	*val = is_temp ? (long)result * 1000 : (long)result;
+
+	nitro_dbg(dev, "sensor 0x%02x -> %llu%s\n", sensor, result, is_temp ? "degC" : "RPM");
+	return 0;
 }
 
-static acpi_status nitro_set_fan_speed()
+/*
+ * Send one (cpu_pct, gpu_pct) pair to the firmware, in the same
+ * mode-then-speed order and with the same payload combinations the
+ * vendor tooling uses. 0 means "let the firmware auto-manage this
+ * fan"; both 0 or both 100 are the special whole-system auto/turbo
+ * cases described in the file header.
+ */
+static acpi_status nitro_set_fan_speed(struct device *dev, int cpu_pct, int gpu_pct)
 {
+        acpi_status status;
 
+        if (cpu_pct < 0 || cpu_pct > 100 || gpu_pct < 0 || gpu_pct > 100)
+                return AE_BAD_PARAMETER;
+
+        if (cpu_pct == 100 && gpu_pct == 100) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_MAX_BOTH, NULL);
+        } else if (cpu_pct == 0 && gpu_pct == 0) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_AUTO_BOTH, NULL);
+        } else if (cpu_pct == 0) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_GPU_ONLY_A, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_GPU_ONLY_B, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)gpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_GPU,
+                                        NULL);
+        } else if (gpu_pct == 0) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_CPU_ONLY_A, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_CPU_ONLY_B, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)cpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_CPU,
+                                        NULL);
+	} else {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_MIXED, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)cpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_CPU,
+                                        NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)gpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_GPU,
+                                        NULL);
+        }
+
+        if (ACPI_SUCCESS(status))
+                dev_info(dev, "fan speed applied: CPU=%d%% GPU=%d%%\n",
+                         cpu_pct, gpu_pct);
+
+        return status;
 }
-
-static int nitro_apply_fan_state()
+/*
+ * Recompute and (re)apply the effective fan state from the two
+ * per-fan mode/duty records. Caller must hold data->lock.
+ */
+static int nitro_apply_fan_state(struct device *dev, struct nitro_data *data)
 {
+        int cpu_pct, gpu_pct;
+        acpi_status status;
 
+        if (data->mode[0] == NITRO_MODE_TURBO || data->mode[1] == NITRO_MODE_TURBO) {
+                status = nitro_set_fan_speed(dev, 100, 100);
+                goto out;
+        }
+
+        if (data->mode[0] == NITRO_MODE_AUTO && data->mode[1] == NITRO_MODE_AUTO) {
+                status = nitro_set_fan_speed(dev, 0, 0);
+                goto out;
+        }
+
+        /* 0 = "let firmware auto-manage this fan" in the custom payload. */
+        cpu_pct = (data->mode[0] == NITRO_MODE_MANUAL) ? data->duty_pct[0] : 0;
+        gpu_pct = (data->mode[1] == NITRO_MODE_MANUAL) ? data->duty_pct[1] : 0;
+
+        /* A manual request of literally 0% would be misread by the
+         * firmware as "auto" (see file header, quirk #2) — nudge it up.
+         */
+        if (data->mode[0] == NITRO_MODE_MANUAL && cpu_pct == 0)
+                cpu_pct = 1;
+        if (data->mode[1] == NITRO_MODE_MANUAL && gpu_pct == 0)
+                gpu_pct = 1;
+
+        status = nitro_set_fan_speed(dev, cpu_pct, gpu_pct);
+
+out:
+        return ACPI_FAILURE(status) ? -EIO : 0;
 }
 
 /* ------------------------------------------------------------------ */
