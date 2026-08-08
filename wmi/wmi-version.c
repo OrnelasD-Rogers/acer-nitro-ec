@@ -1,0 +1,671 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Acer Nitro fan/temperature driver (ACPI-WMI backend)
+ *
+ * Exposes CPU/GPU fan speed and temperature readings, plus fan speed
+ * control, via the standard Linux hwmon interface for Acer
+ * Nitro/Predator laptops that implement the "gaming" ACPI-WMI method
+ * set (GUID WMID_GUID4 below).
+ *
+ * ---------------------------------------------------------------------
+ * WHY THIS VERSION EXISTS
+ * ---------------------------------------------------------------------
+ * The original version of this driver talked to the embedded
+ * controller directly via ec_read()/ec_write() on fixed port
+ * addresses. That approach has a structural problem: the EC keeps
+ * running its own firmware fan-control loop in the background, and
+ * writing a raw duty-cycle register does nothing useful unless the EC
+ * has first been told (via its *mode* register) to hand control over
+ * to software. If that mode switch is skipped or done in the wrong
+ * order, the EC's own firmware loop keeps overriding whatever duty
+ * cycle was written, and the fan appears to never drop below whatever
+ * floor the firmware curve enforces.
+ *
+ * This version avoids that class of bug entirely by not touching the
+ * EC directly. Instead it goes through the same ACPI-WMI "gaming"
+ * method interface that Acer's own NitroSense/PredatorSense utilities
+ * use on Windows (method IDs and payload encodings reverse-engineered
+ * by the Linux-NitroSense / acer-wmi community projects). Every write
+ * always sets the fan *behavior/mode* first and the fan *speed*
+ * second, in the same order and with the same payloads the vendor
+ * tooling uses, which is what actually gets the EC to relinquish
+ * control.
+ *
+ * ---------------------------------------------------------------------
+ * SCOPE
+ * ---------------------------------------------------------------------
+ * Deliberately limited to fan + temperature hwmon attributes only.
+ * The upstream acer-wmi driver this logic is adapted from also
+ * handles wifi/bluetooth rfkill, backlight, hotkeys, RGB keyboard,
+ * battery health, accelerometer, and platform-profile — none of that
+ * is reproduced here.
+ *
+ * Sysfs entries under /sys/class/hwmon/hwmonX/:
+ *
+ *   fan1_input      - CPU fan speed (RPM)
+ *   fan2_input      - GPU fan speed (RPM)
+ *   pwm1            - CPU fan duty cycle (0-255)
+ *   pwm1_enable     - CPU fan mode: 0=turbo, 1=manual, 2=auto
+ *   pwm2            - GPU fan duty cycle (0-255)
+ *   pwm2_enable     - GPU fan mode: 0=turbo, 1=manual, 2=auto
+ *   temp1_input     - CPU temperature (millidegrees Celsius)
+ *   temp2_input     - GPU temperature (millidegrees Celsius)
+ *   temp3_input     - Secondary/system temperature (millidegrees Celsius)
+ *
+ * ---------------------------------------------------------------------
+ * KNOWN PROTOCOL QUIRKS (inherited from the vendor encoding, not bugs
+ * introduced by this driver — documented here so they aren't
+ * mistaken for one)
+ * ---------------------------------------------------------------------
+ *  1. The firmware's fan-behavior register is not fully independent
+ *     per fan: "turbo" and "auto" are whole-system modes that affect
+ *     both fans at once. Only the "custom" behavior supports setting
+ *     CPU and GPU duty independently. So setting pwm1_enable=0
+ *     (turbo) or pwm1_enable=2 (auto) will also change fan2's
+ *     effective mode. This is a hardware/firmware limitation, not
+ *     something this driver can route around without a different,
+ *     undocumented EC command.
+ *  2. In the custom-mode payload, a requested duty of 0% is
+ *     overloaded by the firmware to mean "let this fan run on its own
+ *     automatic curve" rather than "stop the fan". A manual request
+ *     of exactly 0% is therefore nudged up to 1% before being sent,
+ *     so that "manual, very low" and "automatic" remain
+ *     distinguishable to the firmware.
+ *  3. There is no documented WMI command to read back the fan's
+ *     current behavior mode or commanded duty cycle — only to set
+ *     them. pwm1/pwm2/pwm1_enable/pwm2_enable reads therefore report
+ *     the last value this driver successfully wrote (cached
+ *     in-memory), not a live readback from the EC. fan1_input/
+ *     fan2_input/temp*_input, by contrast, ARE live hardware reads.
+ *
+ * Logging:
+ *   - Load with debug=1 for verbose output:
+ *       sudo insmod acer-nitro-ec.ko debug=1
+ *   - Or enable dynamic_debug at runtime (no reload needed):
+ *       echo "module acer_nitro_ec +p" > /sys/kernel/debug/dynamic_debug/control
+ *   - Watch logs:
+ *       sudo dmesg -w | grep acer-nitro-ec
+ */
+
+#define DRIVER_NAME "acer-nitro-ec"
+#define pr_fmt(fmt) DRIVER_NAME ": " fmt
+
+#include <linux/acpi.h>
+#include <linux/bitfield.h>
+#include <linux/bitops.h>
+#include <linux/dmi.h>
+#include <linux/hwmon.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/wmi.h>
+
+/* When debug=1, emit dev_dbg messages as dev_info so they appear in dmesg
+ * without needing to change the kernel log level or dynamic_debug config.
+ */
+static bool debug;
+module_param(debug, bool, 0644);
+MODULE_PARM_DESC(debug, "Enable verbose logging (default: false). "
+		 "Can also use: echo 'module acer_nitro_ec +p' > "
+		 "/sys/kernel/debug/dynamic_debug/control");
+
+#define nitro_dbg(dev, fmt, ...) do {				\
+	if (debug)						\
+		dev_info(dev, fmt, ##__VA_ARGS__);		\
+	else							\
+		dev_dbg(dev, fmt, ##__VA_ARGS__);		\
+} while (0)
+
+/* ------------------------------------------------------------------ */
+/* ACER-WMI Interface                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ *GUID for the Acer WMI device that exposes sensor readout
+ * and fan-control method on Nitro and Predator laptops. Sma GUID used by the
+ * acer-wmi driver's interface helpers.
+ */
+
+#define WMID_GUID4         "7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56"
+
+#define ACER_WMID_GET_GAMING_SYS_INFO_METHODID 5
+#define ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID 14
+#define ACER_WMID_SET_GAMING_FAN_SPEED_METHODID 16
+
+#define ACER_WMID_CMD_GET_SUPPORTED_SENSORS 0x0000
+#define ACER_WMID_CMD_GET_SENSOR_READING 0x0001
+
+enum nitro_sensor_id {
+	NITRO_SENSOR_CPU_TEMP = 0X01,
+	NITRO_SENSOR_CPU_FAN_SPEED = 0X02,
+	NITRO_SENSOR_SYS_TEMP = 0X03,
+	NITRO_SENSOR_GPU_FAN_SPEED = 0X06,
+	NITRO_SENSOR_GPU_TEMP = 0X0A,
+};
+
+#define NITRO_RETURN_STATUS_MASK  GENMASK_ULL(7, 0)
+#define NITRO_SENSOR_INDEX_MASK  GENMASK_ULL(15, 8)
+#define NITRO_SENSOR_READING_MASK  GENMASK_ULL(23, 8)
+#define NITRO_SUPPORTED_SENSORS_MASK  GENMASK_ULL(39, 24)
+
+
+/*
+ * Fan-behavior payload for SET_FAMING_FAN_BEHAVIOR
+ *
+ *These are opaque vendor magic number (reverse-engineered from the
+  Windows utilitys WMI traffic, not ducmented by acer). They are named
+  here for readbility but the values themselves are not something this driver can validate independently
+ *
+ * */
+
+#define FAN_BEHAVIOR_MAX_BOTH 	0x820009ULL /* turbo: both fans full speed */
+#define FAN_BEHAVIOR_AUTO_BOTH 	0x410009ULL /* auto: firmware manages both */
+#define FAN_BEHAVIOR_CUSTOM_GPU_ONLY_A 	0x010001ULL /* enter cutom mode, GPU driven */
+#define FAN_BEHAVIOR_CUSTOM_GPU_ONLY_B 	0xC00008ULL
+#define FAN_BEHAVIOR_CUSTOM_CPU_ONLY_A 	0x400008ULL /* enter custom mode, CPU driven */
+#define FAN_BEHAVIOR_CUSTOM_CPU_ONLY_B 0x030001ULL
+#define FAN_BEHAVIOR_CUSTOM_MIXED 	0xC30009ULL /* both fans independently set*/
+
+#define FAN_INDEX_CPU 1
+#define FAN_INDEX_GPU 4
+
+#define NITRO_MODE_TURBO 0
+#define NITRO_MODE_MANUAL 1
+#define NITRO_MODE_AUTO 2
+
+
+/* ------------------------------------------------------------------ */
+/* Per-device data                                                      */
+/* ------------------------------------------------------------------ */
+
+struct nitro_ec_data {
+	struct device 	*hwmon_dev;
+	struct mutes 	lock; /* protects mode[]/duty_pct[] + WMI writes */
+
+	u64 		supported_sensors;
+	u8 		mode[2];
+	u8 		duty_pct[2];
+};
+
+
+/* WMI helpers                                                           */
+
+static acpi_status nitro_wmi_exec(struct device *dev, u32 method_id, u64 in,
+		u64 *out)
+{
+	struct acpi_buffer input = { sizeof(u64), &in };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+	u64 tmp = 0;
+
+	status = wmi_evaluate_method(WMID_GUID4, 0, method_id, &input, &result);
+	if (ACPI_FAILURE(status)) {
+		dev_warn(dev, "WMI method 0x%x failed: %s\n", method_id,
+				acpi_format_exception(status));
+		return status;
+	}
+
+	obj = result.pointer;
+	if (obj) {
+		if (obj->type == ACPI_TYPE_BUFFER) {
+			if (obj->buffer.length == sizeof(u32)))
+				tmp = *((u32 *)obj->buffer.pointer);
+			else if (obj->buffer.length == sizeof(u64))
+				tmp = *((u64 *)obj->buffer.pointer);
+		} else if (obj->type == ACPI_TYPE_INTEGER) {
+			tmp = (u64)obj->integer.value;
+		}
+	}
+
+	if (out)
+		*out = tmp;
+
+	kfree(result.pointer);
+	nitro_dbg(dev, "WMI method ox%x(in=0x%llx) -> 0x%llx\n", method_id, in, tmp);
+
+	return status;
+}
+
+static int nitro_wmi_get_sys_info(struct device *dev, u64 command, u64 *out)
+{
+	acpi_status status;
+	u64 result;
+
+	status = nitro_wmi_exec(dev, ACER_WMID_GET_GAMING_SYS_INFO_METHODID,
+			command, &result);
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	/* Low byte of the response is a firmware status code; 0 = success.*/
+	if (FIELD_GET(NITRO_RETURN_STATUS_MASK, result))
+		return -EIO;
+
+	*out = result;
+	return 0;
+}
+
+static int nitro_read_sensor(struct device *dev, enum nitro_sensor_id sensor, bool is_temp, long *val)
+{
+	u64 command = ACER_WMID_CMD_GET_SENSOR_READING;
+	u64 result;
+	int ret;
+
+	command |= FIELD_PREP(NITRO_SENSOR_INDEX_MASK, sensor);
+
+	ret = nitro_wmi_get_sys_info(dev, command, &result);
+	if (ret)
+		return ret;
+
+	result = FIELD_GET(NITRO_SENSOR_READING_MASK, result);
+	*val = is_temp ? (long)result * 1000 : (long)result;
+
+	nitro_dbg(dev, "sensor 0x%02x -> %llu%s\n", sensor, result, is_temp ? "degC" : "RPM");
+	return 0;
+}
+
+/*
+ * Send one (cpu_pct, gpu_pct) pair to the firmware, in the same
+ * mode-then-speed order and with the same payload combinations the
+ * vendor tooling uses. 0 means "let the firmware auto-manage this
+ * fan"; both 0 or both 100 are the special whole-system auto/turbo
+ * cases described in the file header.
+ */
+static acpi_status nitro_set_fan_speed(struct device *dev, int cpu_pct, int gpu_pct)
+{
+        acpi_status status;
+
+        if (cpu_pct < 0 || cpu_pct > 100 || gpu_pct < 0 || gpu_pct > 100)
+                return AE_BAD_PARAMETER;
+
+        if (cpu_pct == 100 && gpu_pct == 100) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_MAX_BOTH, NULL);
+        } else if (cpu_pct == 0 && gpu_pct == 0) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_AUTO_BOTH, NULL);
+        } else if (cpu_pct == 0) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_GPU_ONLY_A, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_GPU_ONLY_B, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)gpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_GPU,
+                                        NULL);
+        } else if (gpu_pct == 0) {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_CPU_ONLY_A, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_CPU_ONLY_B, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)cpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_CPU,
+                                        NULL);
+	} else {
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID,
+                                        FAN_BEHAVIOR_CUSTOM_MIXED, NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)cpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_CPU,
+                                        NULL);
+                if (ACPI_FAILURE(status))
+                        return status;
+                status = nitro_wmi_exec(dev, ACER_WMID_SET_GAMING_FAN_SPEED_METHODID,
+                                        (((u64)gpu_pct * 25600) / 100 & 0xFF00) |
+                                        FAN_INDEX_GPU,
+                                        NULL);
+        }
+
+        if (ACPI_SUCCESS(status))
+                dev_info(dev, "fan speed applied: CPU=%d%% GPU=%d%%\n",
+                         cpu_pct, gpu_pct);
+
+        return status;
+}
+/*
+ * Recompute and (re)apply the effective fan state from the two
+ * per-fan mode/duty records. Caller must hold data->lock.
+ */
+static int nitro_apply_fan_state(struct device *dev, struct nitro_data *data)
+{
+        int cpu_pct, gpu_pct;
+        acpi_status status;
+
+        if (data->mode[0] == NITRO_MODE_TURBO || data->mode[1] == NITRO_MODE_TURBO) {
+                status = nitro_set_fan_speed(dev, 100, 100);
+                goto out;
+        }
+
+        if (data->mode[0] == NITRO_MODE_AUTO && data->mode[1] == NITRO_MODE_AUTO) {
+                status = nitro_set_fan_speed(dev, 0, 0);
+                goto out;
+        }
+
+        /* 0 = "let firmware auto-manage this fan" in the custom payload. */
+        cpu_pct = (data->mode[0] == NITRO_MODE_MANUAL) ? data->duty_pct[0] : 0;
+        gpu_pct = (data->mode[1] == NITRO_MODE_MANUAL) ? data->duty_pct[1] : 0;
+
+        /* A manual request of literally 0% would be misread by the
+         * firmware as "auto" (see file header, quirk #2) — nudge it up.
+         */
+        if (data->mode[0] == NITRO_MODE_MANUAL && cpu_pct == 0)
+                cpu_pct = 1;
+        if (data->mode[1] == NITRO_MODE_MANUAL && gpu_pct == 0)
+                gpu_pct = 1;
+
+        status = nitro_set_fan_speed(dev, cpu_pct, gpu_pct);
+
+out:
+        return ACPI_FAILURE(status) ? -EIO : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* hwmon callbacks                                                      */
+/* ------------------------------------------------------------------ */
+
+static const enum nitro_sensor_id nitro_temp_sensor[] = {
+	[0]=NITRO_SENSOR_CPU_TEMP, [1]=NITRO_SENSOR_GPU_TEMP, [2]=NITRO_SENSOR_SYS_TEMP,
+};
+
+static const enum nitro_sensor_id nitro_fan_sensor[] = {
+	[0]=NITRO_SENSOR_CPU_FAN_SPEED, [1]=NITRO_SENSOR_GPU_FAN_SPEED,
+};
+
+static umode_t nitro_hwmon_is_visible(const void *drvdata,
+		enum hwmon_sensor_types type, u32 attr, int channel)
+{
+	const struct nitro_data *data = drvdata;
+	enum nitro_sensor_id sensor;
+
+	switch (type) {
+		case hwmon_fan:
+			if (channel >= ARRAY_SIZE(nitro_fan_sensor))
+				return 0;
+			sensor = nitro_fan_sensor[channel];
+			return (data->supported_sensors & BIT(sensor - 1)) ? 0444 : 0;
+		case hwmon_pwm:
+			if (channel >= ARRAY_SIZE(nitro_fan_sensor))
+				return 0;
+			sensor = nitro_fan_sensor[channel];
+			return (data->supported_sensors & BIT(sensor - 1)) ? 0644 : 0;
+		case hwmon_temp:
+			if (channel >= ARRAY_SIZE(nitro_temp_sensor))
+				return 0;
+			sensor = nitro_temp_sensor[channel];
+			return (data->supported_sensors & BIT(sensor - 1)) ? 0444 : 0;
+		default:
+			return 0;
+	}
+};
+
+static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			    u32 attr, int channel, long *val)
+{
+	struct nitro_data *data = dev_get_drvdata(dev);
+
+	switch (type) {
+	case hwmon_fan:
+		if(channel >= ARRAY_SIZE(nitro_fan_sensor))
+			return -EOPNOTSUPP;
+		return nitro_read_sensor(dev, nitro_fan_sensor[channel], false, val);
+
+	case hwmon_temp:
+		if (channel >= ARRAY_SIZE(nitro_temp_sensor))
+			return -EOPNOTSUPP;
+		return nitro_read_sensor(dev, nitro_temp_sensor[channel], true, val);
+	case hwmon_pwm:
+		if (channel >= 2)
+			return -EOPNOTSUPP;
+		switch (attr) {
+			case hwmon_pwm_input:
+				/* Cached last-written value */
+				mutex_lock(&data->lock);
+				*val = (long)data->duty_pct[channel] * 255 / 100;
+				mutex_unlock(&data->lock);
+				return 0;
+			case hwmon_pwm_enable:
+				mutex_lock(&data->lock);
+				*val = data->mode[channel];
+				return 0;
+			default:
+				return -EOPNOTSUPP;
+		}
+	default:
+		return -EOPNOTSUPP;
+	}
+
+}
+
+static int nitro_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
+			     u32 attr, int channel, long val)
+{
+	struct nitro_data *data = dev_get_drvdata(dev);
+	int ret;
+
+	if (type != hwmon_pwm || channel >= 2)
+		return -EOPNOTSUPP;
+
+	switch (attr) {
+		case hwmon_pwm_enable:
+			if (val < NITRO_MODE_TURBO || val > NITRO_MODE_AUTO)
+				return -EINVAL;
+
+			mutex_lock(&data->lock);
+			data->mode[channel] = val;
+			ret = nitro_apply_fan_state(dev, data);
+			mutex_unlock(&data->lock);
+			return ret;
+
+		case hwmon_pwm_input:
+			if (val < 0 || val > 255)
+				return -EINVAL;
+
+			mutex_lock(&data->lock);
+			if (data->mode[channel] != NITRO_MODE_MANUAL) {
+				mutex_unlock(&data->lock);
+				dev_warn(dev,
+					"%s: set pwm%d_enable=1 (manual) before writing pwm%d\n", DRIVER_NAME, channel + 1, channel + 1);
+				return -EINVAL;
+			}
+
+			data->duty_pct[channel] = (u8)(val * 100 / 255);
+			ret = nitro_apply_fan_state(dev, data);
+			mutex_unlock(&data->lock);
+			return ret;
+		default:
+			return -EOPNOTSUPP;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* hwmon chip descriptor                                                */
+/* ------------------------------------------------------------------ */
+
+static const struct hwmon_channel_info * const nitro_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(fan,
+		HWMON_F_INPUT,   /* fan1 = CPU */
+		HWMON_F_INPUT),  /* fan2 = GPU */
+	HWMON_CHANNEL_INFO(pwm,
+		HWMON_PWM_INPUT | HWMON_PWM_ENABLE,  /* pwm1 = CPU */
+		HWMON_PWM_INPUT | HWMON_PWM_ENABLE), /* pwm2 = GPU */
+	HWMON_CHANNEL_INFO(temp,
+		HWMON_T_INPUT,   /* temp1 = CPU */
+		HWMON_T_INPUT,   /* temp2 = GPU */
+		HWMON_T_INPUT),  /* temp3 = secondary/system */
+	NULL
+};
+
+static const struct hwmon_ops nitro_hwmon_ops = {
+	.is_visible = nitro_hwmon_is_visible,
+	.read       = nitro_hwmon_read,
+	.write      = nitro_hwmon_write,
+};
+
+static const struct hwmon_chip_info nitro_chip_info = {
+	.ops  = &nitro_hwmon_ops,
+	.info = nitro_hwmon_info,
+};
+
+/* ------------------------------------------------------------------ */
+/* Platform driver                                                      */
+/* ------------------------------------------------------------------ */
+
+static int nitro_ec_probe(struct platform_device *pdev)
+{
+	struct nitro_data *data;
+	u64 supported;
+	int ret;
+
+	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!regs)
+		return -ENOMEM;
+
+	mutex_init(&data->lock);
+	data->mode[0] = NITRO_MODE_AUTO;
+	data->mode[1] = NITRO_MODE_AUTO;
+
+	ret = nitro_wmi_get_sys_info(&pdev->dev,
+			ACER_WMID_CMD_GET_SUPPORTED_SENSORS,
+			&supported);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"failed to query supported sensors: %d\n", ret);
+		return ret;
+	}
+
+	data->supported_sensors = FIELD_GET(NITRO_SUPPORTED_SENSORS_MASK, supported);
+	if (!data->supported_sensors) {
+		dev_err(&pdev->dev, "firmware reports no usable sensors\n");
+		return -ENODEV;
+	}
+
+	nitro_dbg(&pdev->dev, "supported sensor bitmap: 0x%llx\n", data->supported_sensors);
+
+	platform_set_drvdata(pdev, data);
+
+	data->hwmon_dev = devm_hwmon_device_register_with_info(
+		&pdev->dev, "acer_nitro_ec", data,
+		&nitro_chip_info, NULL);
+
+	if (IS_ERR(data->hwmon_dev)) {
+		dev_err(&pdev->dev, "hwmon registration failed: %ld\n",
+			PTR_ERR(data->hwmon_dev));
+		return PTR_ERR(data->hwmon_dev);
+	}
+
+	dev_info(&pdev->dev, "hwmon interface registered at %s\n",
+		 dev_name(data->hwmon_dev));
+	if (debug)
+		dev_info(&pdev->dev, "verbose logging enabled\n");
+
+	return 0;
+}
+
+static struct platform_driver nitro_ec_driver = {
+	.probe  = nitro_ec_probe,
+	.driver = {
+		.name = DRIVER_NAME,
+	},
+};
+
+/*
+ =============================================================
+ = Module init/exit - DMI-based device detection             =
+ =============================================================
+ * */
+
+static struct platform_device *nitro_pdev;
+
+/*
+ * Same allowlist as before: this is a sanity check on top of the WMI
+ * GUID check below, not the mechanism used to talk to the hardware
+ *anymore (there is no more per-model register map - the WMI method
+ *set is uniform across models that impement it )
+ * */
+
+
+static const char * const nitro_supported_models[] = {
+	"AN515-44", "AN515-46", "AN515-54", "AN515-56",
+	"AN515-57", "AN515-58", "AN517-55", NULL
+};
+
+static int __init nitro_ec_init(void)
+{
+	const char *model;
+	int ret, i;
+	bool matched = false;
+
+	model = dmi_get_system_info(DMI_PRODUCT_NAME);
+	if (!model)
+		return -ENODEV;
+
+	for (i = 0; nitro_supported_models[i]; i++) {
+		if (strstr(model, nitro_supported_models[i])) {
+			matched = true;
+			break
+		}
+	}
+
+	if (!matched) {
+		pr_info("unsupported model '%s' - not loading\n", model);
+		return -ENODEV;
+	}
+
+	if (!wmi_has_guid(WMID_GUID4)) {
+		pr_info("model '%s' recognized but gaming WMI interface "
+			"(%s) not present - not loading\n", model, WMID_GUID4);
+		return -ENODEV;
+	}
+
+	pr_info("detected '%s', loading driver\n", model);
+
+	ret = platform_driver_register(&nitro_ec_driver);
+	if (ret) {
+		pr_err("platform_driver_register failed: %d\n", ret);
+		return ret;
+	}
+
+	nitro_pdev = platform_device_register_simple(
+		DRIVER_NAME, PLATFORM_DEVID_NONE,
+		NULL, 0);
+
+	if (IS_ERR(nitro_pdev)) {
+		pr_err("platform_device_register failed: %ld\n",
+		       PTR_ERR(nitro_pdev));
+		platform_driver_unregister(&nitro_ec_driver);
+		return PTR_ERR(nitro_pdev);
+	}
+
+	return 0;
+}
+
+static void __exit nitro_ec_exit(void)
+{
+	pr_info("unloading driver\n");
+	platform_device_unregister(nitro_pdev);
+	platform_driver_unregister(&nitro_ec_driver);
+}
+
+module_init(nitro_ec_init);
+module_exit(nitro_ec_exit);
+
+MODULE_AUTHOR("Qapky Qy");
+MODULE_DESCRIPTION("Acer Nitro fan and temperature driver (ACPI-WMI)");
+MODULE_LICENSE("GPL");
+MODULE_ALIAS("dmi:*:svnAcer:pnNitroAN515*:");
+MODULE_ALIAS("dmi:*:svnAcer:pnNitroAN517*:");
+MODULE_ALIAS("wmi:7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56");
