@@ -30,6 +30,7 @@
  *       sudo dmesg -w | grep acer-nitro-ec
  */
 
+#include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
 #define DRIVER_NAME "acer-nitro-ec"
 #define pr_fmt(fmt) DRIVER_NAME ": " fmt
@@ -404,34 +405,52 @@ static struct platform_driver nitro_ec_driver = {
 	},
 };
 
-/* ------------------------------------------------------------------ */
-/* Module init/exit — DMI-based device detection                       */
-/* ------------------------------------------------------------------ */
+/*
+ =============================================================
+ = Module init/exit - DMI-based device detection             =
+ =============================================================
+ * */
 
 static struct platform_device *nitro_pdev;
 
+/*
+ * Same allowlist as before: this is a sanity check on top of the WMI
+ * GUID check below, not the mechanism used to talk to the hardware
+ *anymore (there is no more per-model register map - the WMI method
+ *set is uniform across models that impement it )
+ * */
+
+
+static const char * const nitro_supported_models[] = {
+	"AN515-44", "AN515-46", "AN515-54", "AN515-56",
+	"AN515-57", "AN515-58", "AN517-55", NULL
+};
+
 static int __init nitro_ec_init(void)
 {
-	const struct nitro_ec_regs *regs = NULL;
 	const char *model;
-	int ret;
+	int ret, i;
+	bool matched = false;
 
 	model = dmi_get_system_info(DMI_PRODUCT_NAME);
 	if (!model)
 		return -ENODEV;
 
-	if (strstr(model, "AN515-44"))
-		regs = &regs_an515_44;
-	else if (strstr(model, "AN515-46") ||
-		 strstr(model, "AN515-54") ||
-		 strstr(model, "AN515-56") ||
-		 strstr(model, "AN515-57") ||
-		 strstr(model, "AN515-58") ||
-		 strstr(model, "AN517-55"))
-		regs = &regs_an515_46;
+	for (i = 0; nitro_supported_models[i]; i++) {
+		if (strstr(model, nitro_supported_models[i])) {
+			matched = true;
+			break
+		}
+	}
 
-	if (!regs) {
-		pr_info("unsupported model '%s' — not loading\n", model);
+	if (!matched) {
+		pr_info("unsupported model '%s' - not loading\n", model);
+		return -ENODEV;
+	}
+
+	if (!wmi_has_guid(WMID_GUID4)) {
+		pr_info("model '%s' recognized but gaming WMI interface "
+			"(%s) not present - not loading\n", model, WMID_GUID4);
 		return -ENODEV;
 	}
 
@@ -443,9 +462,9 @@ static int __init nitro_ec_init(void)
 		return ret;
 	}
 
-	nitro_pdev = platform_device_register_data(
-		NULL, DRIVER_NAME, PLATFORM_DEVID_NONE,
-		regs, sizeof(*regs));
+	nitro_pdev = platform_device_register_simple(
+		DRIVER_NAME, PLATFORM_DEVID_NONE,
+		NULL, 0);
 
 	if (IS_ERR(nitro_pdev)) {
 		pr_err("platform_device_register failed: %ld\n",
@@ -467,8 +486,9 @@ static void __exit nitro_ec_exit(void)
 module_init(nitro_ec_init);
 module_exit(nitro_ec_exit);
 
-MODULE_AUTHOR("Linux-NitroSense contributors");
-MODULE_DESCRIPTION("Acer Nitro AN515/AN517 EC fan control driver");
+MODULE_AUTHOR("Qapky Qy");
+MODULE_DESCRIPTION("Acer Nitro fan and temperature driver (ACPI-WMI)");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("dmi:*:svnAcer:pnNitroAN515*:");
 MODULE_ALIAS("dmi:*:svnAcer:pnNitroAN517*:");
+MODULE_ALIAS("wmi:7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56");
