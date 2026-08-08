@@ -175,68 +175,24 @@ static acpi_status nitro_wmi_exec(struct device *dev, u32 method_id, u64 in,
 	return status;
 }
 
-static int nitro_ec_read(u8 addr, u8 *val)
+static int nitro_wmi_get_sys_info()
 {
-	int ret = ec_read(addr, val);
 
-	if (ret)
-		pr_warn("EC read failed at 0x%02X (err %d)\n", addr, ret);
-
-	return ret;
 }
 
-static int nitro_ec_write(u8 addr, u8 val)
+static int nitro_read_sensor()
 {
-	int ret = ec_write(addr, val);
 
-	if (ret)
-		pr_warn("EC write failed at 0x%02X = 0x%02X (err %d)\n",
-			addr, val, ret);
-
-	return ret;
 }
 
-/*
- * Read a 16-bit RPM value from two consecutive EC registers.
- * The EC stores the raw fan RPM as a big-endian 16-bit integer.
- */
-static int nitro_read_fan_rpm(struct device *dev,
-			      const struct nitro_ec_regs *regs, int channel,
-			      long *rpm)
+static acpi_status nitro_set_fan_speed()
 {
-	u8 hi, lo;
-	int ret;
 
-	if (channel == 0) {
-		ret = nitro_ec_read(regs->cpu_fan_rpm_hi, &hi);
-		if (ret)
-			return ret;
-		ret = nitro_ec_read(regs->cpu_fan_rpm_lo, &lo);
-	} else {
-		ret = nitro_ec_read(regs->gpu_fan_rpm_hi, &hi);
-		if (ret)
-			return ret;
-		ret = nitro_ec_read(regs->gpu_fan_rpm_lo, &lo);
-	}
+}
 
-	if (ret)
-		return ret;
+static int nitro_apply_fan_state()
+{
 
-	/*
-	 * The EC naming is misleading: the register called "HIGH BITS" (0x13/0x15)
-	 * holds the low byte of RPM, and "LOW BITS" (0x14/0x16) holds the high byte.
-	 * Confirmed by cross-referencing with the Linux-NitroSense Python implementation:
-	 *   cpufanspeed = cpufanspeedLowBits << 8 | cpufanspeedHighBits
-	 */
-	*rpm = (long)(((u16)lo << 8) | hi);
-
-	nitro_dbg(dev, "%s fan RPM: reg_hi(0x%02X)=0x%02X reg_lo(0x%02X)=0x%02X -> %ld RPM\n",
-		  channel == 0 ? "CPU" : "GPU",
-		  channel == 0 ? regs->cpu_fan_rpm_hi : regs->gpu_fan_rpm_hi, hi,
-		  channel == 0 ? regs->cpu_fan_rpm_lo : regs->gpu_fan_rpm_lo, lo,
-		  *rpm);
-
-	return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -311,81 +267,50 @@ static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 				return -EOPNOTSUPP;
 		}
 	default:
-		break;
+		return -EOPNOTSUPP;
 	}
 
-	return -EOPNOTSUPP;
 }
 
 static int nitro_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 			     u32 attr, int channel, long val)
 {
-	struct nitro_ec_data *data = dev_get_drvdata(dev);
-	const struct nitro_ec_regs *regs = data->regs;
-	u8 ec_val;
+	struct nitro_data *data = dev_get_drvdata(dev);
+	int ret;
 
-	switch (type) {
+	if (type != hwmon_pwm || channel >= 2)
+		return -EOPNOTSUPP;
 
-	case hwmon_pwm:
-		switch (attr) {
+	switch (attr) {
+		case hwmon_pwm_enable:
+			if (val < NITRO_MODE_TURBO || val > NITRO_MODE_AUTO)
+				return -EINVAL;
+
+			mutex_lock(&data->lock);
+			data->mode[channel] = val;
+			ret = nitro_apply_fan_state(dev, data);
+			mutex_unlock(&data->lock);
+			return ret;
 
 		case hwmon_pwm_input:
 			if (val < 0 || val > 255)
 				return -EINVAL;
-			/* Scale 0-255 → 0-100 */
-			ec_val = (u8)(val * 100 / 255);
-			dev_info(dev, "%s fan speed set: hwmon=%ld -> EC=%u%%\n",
-				 channel == 0 ? "CPU" : "GPU", val, ec_val);
-			return nitro_ec_write(channel == 0
-					      ? regs->cpu_fan_speed_ctrl
-					      : regs->gpu_fan_speed_ctrl,
-					      ec_val);
 
-		case hwmon_pwm_enable: {
-			/*
-			 * 0 = turbo (full speed, firmware-forced)
-			 * 1 = manual (controlled via pwm attribute)
-			 * 2 = automatic (firmware manages speed)
-			 */
-			static const char * const mode_names[] = {
-				"turbo", "manual", "auto"
-			};
-			if (val < 0 || val > 2)
+			mutex_lock(&data->lock);
+			if (data->mode[channel] != NITRO_MODE_MANUAL) {
+				mutex_unlock(&data->lock);
+				dev_warn(dev,
+					"%s: set pwm%d_enable=1 (manual) before writing pwm%d\n", DRIVER_NAME, channel + 1, channel + 1);
 				return -EINVAL;
-			if (channel == 0) {
-				if (val == 0)
-					ec_val = CPU_TURBO_MODE;
-				else if (val == 1)
-					ec_val = CPU_MANUAL_MODE;
-				else
-					ec_val = CPU_AUTO_MODE;
-				dev_info(dev,
-					 "CPU fan mode set: %s (EC=0x%02X)\n",
-					 mode_names[val], ec_val);
-				return nitro_ec_write(regs->cpu_fan_mode_ctrl,
-						      ec_val);
-			} else {
-				if (val == 0)
-					ec_val = GPU_TURBO_MODE;
-				else if (val == 1)
-					ec_val = GPU_MANUAL_MODE;
-				else
-					ec_val = GPU_AUTO_MODE;
-				dev_info(dev,
-					 "GPU fan mode set: %s (EC=0x%02X)\n",
-					 mode_names[val], ec_val);
-				return nitro_ec_write(regs->gpu_fan_mode_ctrl,
-						      ec_val);
 			}
-		}
-		}
-		break;
 
-	default:
-		break;
+			data->duty_pct[channel] = (u8)(val * 100 / 255);
+			ret = nitro_apply_fan_state(dev, data);
+			mutex_unlock(&data->lock);
+			return ret;
+		default:
+			return -EOPNOTSUPP;
 	}
-
-	return -EOPNOTSUPP;
 }
 
 /* ------------------------------------------------------------------ */
@@ -402,7 +327,7 @@ static const struct hwmon_channel_info * const nitro_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(temp,
 		HWMON_T_INPUT,   /* temp1 = CPU */
 		HWMON_T_INPUT,   /* temp2 = GPU */
-		HWMON_T_INPUT),  /* temp3 = system */
+		HWMON_T_INPUT),  /* temp3 = secondary/system */
 	NULL
 };
 
@@ -423,30 +348,35 @@ static const struct hwmon_chip_info nitro_chip_info = {
 
 static int nitro_ec_probe(struct platform_device *pdev)
 {
-	const struct nitro_ec_regs *regs;
-	struct nitro_ec_data *data;
+	struct nitro_data *data;
+	u64 supported;
+	int ret;
 
-	regs = dev_get_platdata(&pdev->dev);
-	if (!regs) {
-		dev_err(&pdev->dev, "no platform data — aborting probe\n");
+	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!regs)
+		return -ENOMEM;
+
+	mutex_init(&data->lock);
+	data->mode[0] = NITRO_MODE_AUTO;
+	data->mode[1] = NITRO_MODE_AUTO;
+
+	ret = nitro_wmi_get_sys_info(&pdev->dev,
+			ACER_WMID_CMD_GET_SUPPORTED_SENSORS,
+			&supported);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"failed to query supported sensors: %d\n", ret);
+		return ret;
+	}
+
+	data->supported_sensors = FIELD_GET(NITRO_SUPPORTED_SENSORS_MASK, supported);
+	if (!data->supported_sensors) {
+		dev_err(&pdev->dev, "firmware reports no usable sensors\n");
 		return -ENODEV;
 	}
 
-	dev_dbg(&pdev->dev, "EC register map:\n"
-		"  CPU fan mode=0x%02X speed=0x%02X rpm=0x%02X/0x%02X\n"
-		"  GPU fan mode=0x%02X speed=0x%02X rpm=0x%02X/0x%02X\n"
-		"  Temps: cpu=0x%02X gpu=0x%02X sys=0x%02X\n",
-		regs->cpu_fan_mode_ctrl, regs->cpu_fan_speed_ctrl,
-		regs->cpu_fan_rpm_hi,    regs->cpu_fan_rpm_lo,
-		regs->gpu_fan_mode_ctrl, regs->gpu_fan_speed_ctrl,
-		regs->gpu_fan_rpm_hi,    regs->gpu_fan_rpm_lo,
-		regs->cpu_temp, regs->gpu_temp, regs->sys_temp);
+	nitro_dbg(&pdev->dev, "supported sensor bitmap: 0x%llx\n", data->supported_sensors);
 
-	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	data->regs = regs;
 	platform_set_drvdata(pdev, data);
 
 	data->hwmon_dev = devm_hwmon_device_register_with_info(
