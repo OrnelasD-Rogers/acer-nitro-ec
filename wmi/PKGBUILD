@@ -1,0 +1,26 @@
+# Maintainer: OrnelasD-Rogers <https://github.com/OrnelasD-Rogers>
+# Contributor: Qapkyy Qy <https://github.com/Qapkyy>
+pkgname=acer-nitro-wmi-dkms
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Acer Nitro AN515/AN517 WMI fan control driver (hwmon, DKMS)"
+arch=('any')
+url="https://github.com/OrnelasD-Rogers/acer-nitro-ec"
+license=('GPL-2.0-only')
+depends=('dkms')
+conflicts=('acer-nitro-ec-dkms')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+	cd "$srcdir/acer-nitro-ec-$pkgver/wmi"
+
+	local dest="$pkgdir/usr/src/acer-nitro-wmi-$pkgver"
+	install -dm755 "$dest"
+
+	install -m644 wmi-version.c "$dest/"
+	install -m644 Makefile      "$dest/"
+	install -m644 dkms.conf     "$dest/"
+
+	sed -i "s/@PKGVER@/$pkgver/" "$dest/dkms.conf"
+}
