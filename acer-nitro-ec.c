@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Acer Nitro EC fan control driver
+ * Acer Nitro fan/temperature driver (ACPI-WMI backend)
  *
- * Exposes CPU/GPU fan speed control and temperature readings via the
- * standard Linux hwmon interface for Acer Nitro AN515/AN517 laptops.
+ * Exposes CPU/GPU fan speed and temperature readings, plus fan speed
+ * control, via the standard Linux hwmon interface for Acer
+ * Nitro/Predator laptops that implement the "gaming" ACPI-WMI method
+ * set (GUID WMID_GUID4 below).
  *
- * Supported models:
- *   AN515-44, AN515-46, AN515-54, AN515-56, AN515-57, AN515-58, AN517-55
+ * ---------------------------------------------------------------------
+ * WHY THIS VERSION EXISTS
+ * ---------------------------------------------------------------------
+ * The original version of this driver talked to the embedded
+ * controller directly via ec_read()/ec_write() on fixed port
+ * addresses. That approach has a structural problem: the EC keeps
+ * running its own firmware fan-control loop in the background, and
+ * writing a raw duty-cycle register does nothing useful unless the EC
+ * has first been told (via its *mode* register) to hand control over
+ * to software. If that mode switch is skipped or done in the wrong
+ * order, the EC's own firmware loop keeps overriding whatever duty
+ * cycle was written, and the fan appears to never drop below whatever
+ * floor the firmware curve enforces.
  *
- * Once loaded, the following sysfs entries become available under
- * /sys/class/hwmon/hwmonX/:
+ * This version avoids that class of bug entirely by not touching the
+ * EC directly. Instead it goes through the same ACPI-WMI "gaming"
+ * method interface that Acer's own NitroSense/PredatorSense utilities
+ * use on Windows (method IDs and payload encodings reverse-engineered
+ * by the Linux-NitroSense / acer-wmi community projects). Every write
+ * always sets the fan *behavior/mode* first and the fan *speed*
+ * second, in the same order and with the same payloads the vendor
+ * tooling uses, which is what actually gets the EC to relinquish
+ * control.
+ *
+ * ---------------------------------------------------------------------
+ * SCOPE
+ * ---------------------------------------------------------------------
+ * Deliberately limited to fan + temperature hwmon attributes only.
+ * The upstream acer-wmi driver this logic is adapted from also
+ * handles wifi/bluetooth rfkill, backlight, hotkeys, RGB keyboard,
+ * battery health, accelerometer, and platform-profile — none of that
+ * is reproduced here.
+ *
+ * Sysfs entries under /sys/class/hwmon/hwmonX/:
  *
  *   fan1_input      - CPU fan speed (RPM)
  *   fan2_input      - GPU fan speed (RPM)
@@ -19,7 +50,33 @@
  *   pwm2_enable     - GPU fan mode: 0=turbo, 1=manual, 2=auto
  *   temp1_input     - CPU temperature (millidegrees Celsius)
  *   temp2_input     - GPU temperature (millidegrees Celsius)
- *   temp3_input     - System temperature (millidegrees Celsius)
+ *   temp3_input     - Secondary/system temperature (millidegrees Celsius)
+ *
+ * ---------------------------------------------------------------------
+ * KNOWN PROTOCOL QUIRKS (inherited from the vendor encoding, not bugs
+ * introduced by this driver — documented here so they aren't
+ * mistaken for one)
+ * ---------------------------------------------------------------------
+ *  1. The firmware's fan-behavior register is not fully independent
+ *     per fan: "turbo" and "auto" are whole-system modes that affect
+ *     both fans at once. Only the "custom" behavior supports setting
+ *     CPU and GPU duty independently. So setting pwm1_enable=0
+ *     (turbo) or pwm1_enable=2 (auto) will also change fan2's
+ *     effective mode. This is a hardware/firmware limitation, not
+ *     something this driver can route around without a different,
+ *     undocumented EC command.
+ *  2. In the custom-mode payload, a requested duty of 0% is
+ *     overloaded by the firmware to mean "let this fan run on its own
+ *     automatic curve" rather than "stop the fan". A manual request
+ *     of exactly 0% is therefore nudged up to 1% before being sent,
+ *     so that "manual, very low" and "automatic" remain
+ *     distinguishable to the firmware.
+ *  3. There is no documented WMI command to read back the fan's
+ *     current behavior mode or commanded duty cycle — only to set
+ *     them. pwm1/pwm2/pwm1_enable/pwm2_enable reads therefore report
+ *     the last value this driver successfully wrote (cached
+ *     in-memory), not a live readback from the EC. fan1_input/
+ *     fan2_input/temp*_input, by contrast, ARE live hardware reads.
  *
  * Logging:
  *   - Load with debug=1 for verbose output:
