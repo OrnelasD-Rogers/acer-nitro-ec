@@ -6,7 +6,7 @@ Acer Nitro AN515/AN517 laptops.
 
 ## Supported models
 
-- AN515-44, AN515-46, AN515-54, AN515-56, AN515-57, AN515-58
+- AN515-44, AN515-46, AN515-54, AN515-55, AN515-56, AN515-57, AN515-58
 - AN517-55
 
 ## Features
@@ -56,17 +56,17 @@ After loading, the following files are available under
 `/sys/class/hwmon/hwmonX/` (find the right `hwmonX` with
 `grep -l acer_nitro_ec /sys/class/hwmon/*/name`):
 
-| File | Access | Description |
-|------|--------|-------------|
-| `fan1_input` | r | CPU fan speed (RPM) |
-| `fan2_input` | r | GPU fan speed (RPM) |
-| `pwm1` | rw | CPU fan duty cycle (0–255) |
-| `pwm2` | rw | GPU fan duty cycle (0–255) |
-| `pwm1_enable` | rw | CPU fan mode: `0`=Turbo, `1`=Manual, `2`=Auto |
-| `pwm2_enable` | rw | GPU fan mode: `0`=Turbo, `1`=Manual, `2`=Auto |
-| `temp1_input` | r | CPU temperature (m°C) |
-| `temp2_input` | r | GPU temperature (m°C) |
-| `temp3_input` | r | System temperature (m°C) |
+| File          | Access | Description                                   |
+| ------------- | ------ | --------------------------------------------- |
+| `fan1_input`  | r      | CPU fan speed (RPM)                           |
+| `fan2_input`  | r      | GPU fan speed (RPM)                           |
+| `pwm1`        | rw     | CPU fan duty cycle (0–255)                    |
+| `pwm2`        | rw     | GPU fan duty cycle (0–255)                    |
+| `pwm1_enable` | rw     | CPU fan mode: `0`=Turbo, `1`=Manual, `2`=Auto |
+| `pwm2_enable` | rw     | GPU fan mode: `0`=Turbo, `1`=Manual, `2`=Auto |
+| `temp1_input` | r      | CPU temperature (m°C)                         |
+| `temp2_input` | r      | GPU temperature (m°C)                         |
+| `temp3_input` | r      | System temperature (m°C)                      |
 
 Example — set CPU fan to manual at ~50% and read current speed:
 

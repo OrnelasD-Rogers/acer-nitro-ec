@@ -6,7 +6,7 @@
  * standard Linux hwmon interface for Acer Nitro AN515/AN517 laptops.
  *
  * Supported models:
- *   AN515-44, AN515-46, AN515-54, AN515-56, AN515-57, AN515-58, AN517-55
+ *   AN515-44, AN515-46, AN515-54, AN515-55, AN515-56, AN515-57, AN515-58, AN517-55
  *
  * Once loaded, the following sysfs entries become available under
  * /sys/class/hwmon/hwmonX/:
@@ -473,6 +473,7 @@ static int __init nitro_ec_init(void)
 		regs = &regs_an515_44;
 	else if (strstr(model, "AN515-46") ||
 		 strstr(model, "AN515-54") ||
+		 strstr(model, "AN515-55") ||
 		 strstr(model, "AN515-56") ||
 		 strstr(model, "AN515-57") ||
 		 strstr(model, "AN515-58") ||
